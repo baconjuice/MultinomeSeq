@@ -6,19 +6,6 @@
 	<string>English</string>
 	<key>CFBundleDisplayName</key>
 	<string>Multinome Sequencer</string>
-	<key>CFBundleDocumentTypes</key>
-	<array>
-		<dict>
-			<key>CFBundleTypeOSTypes</key>
-			<array>
-				<string>****</string>
-				<string>fold</string>
-				<string>disk</string>
-			</array>
-			<key>CFBundleTypeRole</key>
-			<string>Viewer</string>
-		</dict>
-	</array>
 	<key>CFBundleExecutable</key>
 	<string>Multinome Sequencer</string>
 	<key>CFBundleGetInfoString</key>
@@ -58,7 +45,7 @@
 		<key>alias</key>
 		<false/>
 		<key>argv_emulation</key>
-		<true/>
+		<false/>
 		<key>emulate_shell_environment</key>
 		<false/>
 		<key>no_chdir</key>
@@ -83,9 +70,9 @@
 	<key>PythonInfoDict</key>
 	<dict>
 		<key>PythonExecutable</key>
-		<string>/Users/baconjuice/Monome/venv/bin/python</string>
+		<string>/Users/baconjuice/Multinome/venv/bin/python</string>
 		<key>PythonLongVersion</key>
-		<string>3.12.4 (main, Jul 12 2025, 21:36:43) [Clang 17.0.0 (clang-1700.0.13.5)]</string>
+		<string>3.12.4 (main, Jul 12 2025, 23:58:47) [Clang 17.0.0 (clang-1700.0.13.5)]</string>
 		<key>PythonShortVersion</key>
 		<string>3.1</string>
 		<key>py2app</key>

@@ -1,0 +1,3 @@
+monome
+python-rtmidi
+py2app

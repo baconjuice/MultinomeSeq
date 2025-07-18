@@ -4,12 +4,10 @@ APP = ['MultinomeSeqV2.4.py']
 APP_NAME = "Multinome Sequencer"
 ICON_FILE = 'Multinome.icns'
 
-# The icon file needs to be included in the app bundle
-DATA_FILES = [ICON_FILE]
-
 OPTIONS = {
-    'argv_emulation': True,
-    'packages': ['rtmidi', 'monome'], # tkinter is part of stdlib
+    'argv_emulation': False,
+    'packages': ['rtmidi', 'monome'],
+    'includes': ['monome.serialosc', 'monome.grid', 'monome.events', 'monome.led'],
     'iconfile': ICON_FILE,
     'plist': {
         'CFBundleName': APP_NAME,
@@ -24,7 +22,6 @@ OPTIONS = {
 
 setup(
     app=APP,
-    data_files=DATA_FILES,
     options={'py2app': OPTIONS},
     setup_requires=['py2app'],
 )
