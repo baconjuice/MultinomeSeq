@@ -1,6 +1,6 @@
 from setuptools import setup
 
-APP = ['MultinomeSeqV2.4.py']
+APP = ['MultinomeSeqV2.5.py']
 APP_NAME = "Multinome Sequencer"
 ICON_FILE = 'Multinome.icns'
 

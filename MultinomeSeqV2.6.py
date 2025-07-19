@@ -6,6 +6,16 @@ import tkinter as tk
 from tkinter import filedialog
 import monome, rtmidi
 
+# Compatibility layer for different rtmidi versions
+try:
+    # Newer version (python-rtmidi >= 1.5.0)
+    MidiOut = rtmidi.RtMidiOut
+    MidiIn = rtmidi.RtMidiIn
+except AttributeError:
+    # Older version (python-rtmidi < 1.5.0)
+    MidiOut = rtmidi.MidiOut
+    MidiIn = rtmidi.MidiIn
+
 # ───────── constants ─────────────────────────────────────
 ROWS        = 8
 CELL_SIZE   = 20
@@ -46,6 +56,7 @@ class Track:
         self.steps      = [[0]*cols for _ in range(ROWS)]   # 0 = off, 1-127 = velocity
         self.playcol    = 0
         self.midi_chan  = midi_chan
+        self.midi_out_port = "MonomeSeq Out"  # Default MIDI output port name
         self.mute       = False
         self.scale      = "Major"
         self.root_note  = 60  # C4
@@ -92,22 +103,104 @@ state = SeqState()
 
 # ───────── backend (Monome + threaded MIDI) ─────────────
 class Backend:
+    def _get_port_names(self, midi_obj):
+        """Helper to get port names from rtmidi object."""
+        try:
+            # Newer API
+            return [midi_obj.getPortName(i) for i in range(midi_obj.getPortCount())]
+        except AttributeError:
+            # Older API
+            return midi_obj.get_ports()
+    
+    def _open_port(self, midi_obj, port_num):
+        """Helper to open a port with API compatibility."""
+        try:
+            return midi_obj.openPort(port_num)
+        except AttributeError:
+            return midi_obj.open_port(port_num)
+    
+    def _open_virtual_port(self, midi_obj, name):
+        """Helper to open virtual port with API compatibility."""
+        try:
+            return midi_obj.openVirtualPort(name)
+        except AttributeError:
+            return midi_obj.open_virtual_port(name)
+    
+    def _open_port_or_virtual(self, midi_obj, ports, port_num, virtual_name):
+        """Helper to open port or virtual port."""
+        if ports:
+            self._open_port(midi_obj, port_num)
+        else:
+            self._open_virtual_port(midi_obj, virtual_name)
+    
+    def _close_port(self, midi_obj):
+        """Helper to close port with API compatibility."""
+        try:
+            return midi_obj.closePort()
+        except AttributeError:
+            return midi_obj.close_port()
+    
+    def _send_message(self, midi_obj, msg):
+        """Helper to send message with API compatibility."""
+        try:
+            return midi_obj.sendMessage(msg)
+        except AttributeError:
+            return midi_obj.send_message(msg)
+    
+    def _ignore_types(self, midi_obj, sysex, time, active_sense):
+        """Helper to ignore types with API compatibility."""
+        try:
+            return midi_obj.ignoreTypes(sysex, time, active_sense)
+        except AttributeError:
+            return midi_obj.ignore_types(sysex, time, active_sense)
+    
+    def _set_callback(self, midi_obj, callback):
+        """Helper to set callback with API compatibility."""
+        try:
+            return midi_obj.setCallback(callback)
+        except AttributeError:
+            return midi_obj.set_callback(callback)
+    
     def __init__(self, loop):
         self.loop = loop
-        # threaded MIDI-out
-        self.midi_out = rtmidi.RtMidiOut()
-        outs = self.midi_out.get_ports()
-        (self.midi_out.open_port if outs
-         else self.midi_out.open_virtual_port)(0 if outs else "MonomeSeq Out")
+        # threaded MIDI-out - maintain backward compatibility
+        self.midi_out = MidiOut()
+        outs = self._get_port_names(self.midi_out)
+        self._open_port_or_virtual(self.midi_out, outs, 0, "MonomeSeq Out")
+        
+        # Track multiple MIDI output devices for per-track routing
+        self.midi_outputs = {}  # port_name -> MidiOut object
+        self.midi_outputs["MonomeSeq Out"] = self.midi_out  # Default port
+        
         self.midi_q   = queue.Queue()
         threading.Thread(target=self._midi_worker, daemon=True).start()
 
         # MIDI-in for external clock
-        self.midi_in = rtmidi.RtMidiIn()
-        self.midi_in.ignore_types(False, False)
-        self.midi_in.set_callback(self._clock_in)
-        ins = self.midi_in.get_ports()
-        if ins: self.midi_in.open_port(0)
+        self.midi_in = None
+        self.midi_clock_pending = False  # Flag for pending clock ticks
+        self._setup_midi_input()
+        
+    def _setup_midi_input(self):
+        """Setup MIDI input with proper error handling."""
+        self.midi_callback_active = False
+        
+        try:
+            self.midi_in = MidiIn()
+            self._ignore_types(self.midi_in, False, False, False)  # Don't ignore timing messages
+            
+            ins = self._get_port_names(self.midi_in)
+            print(f"Available MIDI input ports: {ins}")
+            
+            if ins: 
+                print("✓ MIDI input ready - use GUI to select port")
+                self.midi_callback_active = True  # Enable callback mode
+            else:
+                print("⚠ No MIDI input ports available")
+                
+        except Exception as e:
+            print(f"✗ Failed to setup MIDI input: {e}")
+            self.midi_in = None
+            self.midi_callback_active = False
 
         # Monome
         self.grid_map, self.offsets, self.gui = {}, {}, None
@@ -119,24 +212,86 @@ class Backend:
         while True:
             msg = self.midi_q.get()
             if msg is None: break
-            with contextlib.suppress(Exception):
-                self.midi_out.send_message(msg)
+            
+            # Check if message includes port specification
+            if isinstance(msg, tuple) and len(msg) == 2:
+                port_name, midi_data = msg
+                midi_out = self.get_midi_output(port_name)
+                with contextlib.suppress(Exception):
+                    self._send_message(midi_out, midi_data)
+            else:
+                # Default behavior - use main MIDI output
+                with contextlib.suppress(Exception):
+                    self._send_message(self.midi_out, msg)
 
-    def qmsg(self,*b): self.midi_q.put(list(b))
+    def qmsg(self, *b): 
+        self.midi_q.put(list(b))
+    
+    def qmsg_to_port(self, port_name, *b):
+        """Send MIDI message to specific port."""
+        self.midi_q.put((port_name, list(b)))
+    
+    def get_midi_output(self, port_name):
+        """Get or create MIDI output for specific port."""
+        if port_name not in self.midi_outputs:
+            try:
+                midi_out = MidiOut()
+                outs = self._get_port_names(midi_out)
+                
+                # Try to open the specific port
+                for i, p in enumerate(outs):
+                    if p == port_name:
+                        self._open_port(midi_out, i)
+                        self.midi_outputs[port_name] = midi_out
+                        return midi_out
+                
+                # If port not found, create virtual port
+                self._open_virtual_port(midi_out, f"{port_name} (virtual)")
+                self.midi_outputs[port_name] = midi_out
+                return midi_out
+                
+            except Exception:
+                # Fallback to default output
+                return self.midi_out
+        
+        return self.midi_outputs[port_name]
 
     def set_port(self,name:str):
-        with contextlib.suppress(Exception): self.midi_out.close_port()
-        self.midi_out = rtmidi.RtMidiOut()
-        outs = self.midi_out.get_ports()
+        with contextlib.suppress(Exception): self._close_port(self.midi_out)
+        self.midi_out = MidiOut()
+        outs = self._get_port_names(self.midi_out)
         for i,p in enumerate(outs):
-            if p==name: self.midi_out.open_port(i); return
-        self.midi_out.open_virtual_port("MonomeSeq Out (virtual)")
+            if p==name: self._open_port(self.midi_out, i); return
+        self._open_virtual_port(self.midi_out, "MonomeSeq Out (virtual)")
 
     def set_in_port(self, name: str):
-        with contextlib.suppress(Exception): self.midi_in.close_port()
-        ins = self.midi_in.get_ports()
+        """Switch to a different MIDI input port."""
+        
+        # Close current port if open
+        if self.midi_in and hasattr(self.midi_in, 'is_port_open') and self.midi_in.is_port_open():
+            with contextlib.suppress(Exception): 
+                self._close_port(self.midi_in)
+        
+        # Find and open the new port
+        ins = self._get_port_names(self.midi_in)
         for i, p in enumerate(ins):
-            if p == name: self.midi_in.open_port(i); return
+            if p == name: 
+                try:
+                    self._open_port(self.midi_in, i)
+                    print(f"✓ MIDI input: {name}")
+                    
+                    # Try to set callback on new port
+                    if self.midi_callback_active:
+                        try:
+                            self._set_callback(self.midi_in, self._clock_in)
+                        except Exception as e:
+                            print(f"⚠ MIDI callback failed: {e}")
+                    
+                    return
+                except Exception as e:
+                    print(f"✗ Failed to open MIDI port {name}: {e}")
+        
+        print(f"✗ MIDI port {name} not found")
 
     # SerialOSC
     async def start(self) -> None:
@@ -331,42 +486,61 @@ class Backend:
                 g.led_row(0, ROWS-1-y, row)
 
     
-    # MIDI clock IN
+    # MIDI clock IN - ultra-lightweight callback
     def _clock_in(self, event, _):
-        if state.clock_mode != "receive": return
-        msg, _ = event
-        b = msg[0]
-
-        if b == 0xFA:  # MIDI Start
-            state.running = True
-            state.tick_count = 0
-            state.beat_counter = 0
-            for track in state.tracks:
-                track.playcol = 0
-            print("MIDI Start received, sequence reset.")
-        elif b == 0xFB:  # MIDI Continue
-            state.running = True
-            print("MIDI Continue received.")
-        elif b == 0xFC:  # MIDI Stop
-            state.running = False
-            print("MIDI Stop received.")
-        elif b == 0xF2:  # Song Position Pointer
-            if len(msg) > 2 and state.cols > 0:
-                pos = (msg[2] << 7) | msg[1]
-                state.beat_counter = pos
+        # Skip processing if not in receive mode
+        if state.clock_mode != "receive": 
+            return
+        
+        try:
+            msg, _ = event
+            if not msg:
+                return
+                
+            b = msg[0]
+            
+            # Process MIDI messages with minimal overhead
+            if b == 0xFA:  # MIDI Start
+                state.running = True
+                state.tick_count = 0
+                state.beat_counter = 0
                 for track in state.tracks:
-                    track.playcol = (state.beat_counter // track.subdivision) % state.cols
-                print(f"MIDI SPP received, jumping to beat {pos}.")
-        elif b == 0xF8 and state.running:  # MIDI Clock
-            state.tick_count = (state.tick_count + 1) % 6
-            if state.tick_count == 0:
-                asyncio.run_coroutine_threadsafe(self._step(), self.loop)
+                    track.playcol = 0
+                print("MIDI Start")
+            elif b == 0xFB:  # MIDI Continue
+                state.running = True
+                print("MIDI Continue")
+            elif b == 0xFC:  # MIDI Stop
+                state.running = False
+                print("MIDI Stop")
+            elif b == 0xF8 and state.running:  # MIDI Clock - minimal processing
+                state.tick_count = (state.tick_count + 1) % 6
+                if state.tick_count == 0:
+                    self.midi_clock_pending = True
+        except:
+            # Silently ignore callback errors to prevent timing issues
+            pass
 
     # This clock runs in a separate thread to ensure its timing is not
     # affected by GUI workload or other asyncio tasks.
     def _threaded_clock_loop(self):
         import time
         while self.running:
+            # Poll for MIDI messages in receive mode (only if callback is not active)
+            if state.clock_mode == "receive" and self.midi_in and not self.midi_callback_active:
+                try:
+                    # Check for MIDI messages (polling)
+                    msg = self.midi_in.get_message()
+                    if msg and msg[0]:  # get_message returns (message, timestamp)
+                        self._process_midi_message(msg[0])
+                except Exception as e:
+                    pass
+            
+            # Handle pending MIDI clock ticks
+            if self.midi_clock_pending and state.clock_mode == "receive":
+                asyncio.run_coroutine_threadsafe(self._step(), self.loop)
+                self.midi_clock_pending = False
+            
             if state.running and state.clock_mode in ("internal","send"):
                 # Safely schedule the _step coroutine to run on the main asyncio loop
                 asyncio.run_coroutine_threadsafe(self._step(), self.loop)
@@ -376,6 +550,31 @@ class Backend:
             sw=state.swing
             delay=step*(1+sw) if state.beat_counter%2 else step*(1-sw)
             time.sleep(delay)
+    
+    def _process_midi_message(self, msg):
+        """Process a MIDI message (for polling mode)."""
+        if not msg or state.clock_mode != "receive":
+            return
+            
+        b = msg[0]
+        
+        if b == 0xFA:  # MIDI Start
+            state.running = True
+            state.tick_count = 0
+            state.beat_counter = 0
+            for track in state.tracks:
+                track.playcol = 0
+            print("MIDI Start")
+        elif b == 0xFB:  # MIDI Continue
+            state.running = True
+            print("MIDI Continue")
+        elif b == 0xFC:  # MIDI Stop
+            state.running = False
+            print("MIDI Stop")
+        elif b == 0xF8 and state.running:  # MIDI Clock
+            state.tick_count = (state.tick_count + 1) % 6
+            if state.tick_count == 0:
+                self.midi_clock_pending = True
 
     # step
     async def _step(self):
@@ -405,9 +604,9 @@ class Backend:
                         degree = r % num_degrees
                         note_offset = (octave * 12) + scale_intervals[degree]
                         note = tr.root_note + note_offset
-                        self.qmsg(0x90 | tr.midi_chan, note, vel)
+                        self.qmsg_to_port(tr.midi_out_port, 0x90 | tr.midi_chan, note, vel)
                         notes.append(note)
-                asyncio.create_task(self._note_off(notes, tr.midi_chan))
+                asyncio.create_task(self._note_off(notes, tr.midi_chan, tr.midi_out_port))
 
         if did_play:
             self.redraw_monome()
@@ -421,14 +620,14 @@ class Backend:
         state.beat_counter += 1
 
 
-    async def _note_off(self,ns,ch):
+    async def _note_off(self, ns, ch, midi_out_port="MonomeSeq Out"):
         await asyncio.sleep((60/state.bpm/4)*GATE_RATIO)
-        for n in ns: self.qmsg(0x80|ch,n,0)
+        for n in ns: self.qmsg_to_port(midi_out_port, 0x80|ch, n, 0)
 
     def shutdown(self):
         self.running = False # Set running flag to false
-        with contextlib.suppress(Exception): self.midi_out.close_port()
-        with contextlib.suppress(Exception): self.midi_in.close_port()
+        with contextlib.suppress(Exception): self._close_port(self.midi_out)
+        with contextlib.suppress(Exception): self._close_port(self.midi_in)
 
 # ───────── GUI ────────────────────────────────────────────
 class SequencerGUI:
@@ -482,17 +681,27 @@ class SequencerGUI:
         # MIDI In Port
         tk.Label(in_frame, text="Port", font=LF, fg="#ddd", bg="#222").pack(side="left", padx=(5,2))
         self.midi_in_port_var = tk.StringVar()
-        ins = self.be.midi_in.get_ports()
-        in_port_val = ins[0] if ins else "None"
-        self.midi_in_port_var.set(in_port_val)
-        self.be.set_in_port(in_port_val)
-        self.midi_in_menu = tk.OptionMenu(in_frame, self.midi_in_port_var, *ins, command=self.be.set_in_port)
+        ins = self.be._get_port_names(self.be.midi_in)
+        
+        # Prefer IAC Driver Bus 1 if available, otherwise first port
+        preferred_port = ins[0] if ins else "None"
+        for port in ins:
+            if "IAC Driver Bus 1" in port:
+                preferred_port = port
+                break
+        
+        self.midi_in_port_var.set(preferred_port)
+        self.midi_in_menu = tk.OptionMenu(in_frame, self.midi_in_port_var, *ins, command=self._on_midi_in_port_change)
         self.midi_in_menu.config(width=15)
         self.midi_in_menu.pack(side="left", padx=4)
+        
+        # Set the initial port
+        if ins:
+            self.be.set_in_port(preferred_port)
 
         # MIDI In Channel
         tk.Label(in_frame, text="In Ch", font=LF, fg="#ddd", bg="#222").pack(side="left", padx=(8, 2))
-        self.in_chan_spin = tk.Spinbox(in_frame, from_=0, to=16, width=3, command=self._set_in_chan) # 0 for All
+        self.in_chan_spin = tk.Spinbox(in_frame, from_=0, to=16, width=3, command=self._set_chan) # 0 for All
         self.in_chan_spin.delete(0, "end"); self.in_chan_spin.insert(0, state.midi_in_chan)
         self.in_chan_spin.pack(side="left")
 
@@ -501,19 +710,20 @@ class SequencerGUI:
         self.mode = tk.StringVar(value=state.clock_mode)
         tk.OptionMenu(in_frame, self.mode, "internal", "send", "receive", command=lambda m: setattr(state, "clock_mode", m)).pack(side="left")
 
-        # --- MIDI Out Section ---
-        out_frame = tk.LabelFrame(mid_ports, text="MIDI Out", font=LF, fg="#ddd", bg="#222", bd=1, relief="groove")
+        # --- MIDI Out Section (Per-Track) ---
+        out_frame = tk.LabelFrame(mid_ports, text="MIDI Out (Per Track)", font=LF, fg="#ddd", bg="#222", bd=1, relief="groove")
         out_frame.pack(side="left", padx=2, pady=2, fill="y")
 
-        # MIDI Out Port
-        tk.Label(out_frame, text="Port", font=LF, fg="#ddd", bg="#222").pack()
-        outs = self.be.midi_out.get_ports()
-        self.port = tk.StringVar(value=outs[0] if outs else "MonomeSeq Out")
-        self.port_menu = tk.OptionMenu(mid_ports, self.port, self.port.get(), *outs, command=self.be.set_port)
-        self.port_menu.pack(side="left", padx=4)
-        tk.Button(mid_ports, text="Refresh", font=BF, command=self._refresh_midi_ports).pack(side="left", padx=4)
-        tk.Label(mid_ports, text="Out Ch", font=LF, fg="#ddd", bg="#222").pack(side="left", padx=(12, 2))
-        self.chan = tk.Spinbox(mid_ports, from_=1, to=16, width=3, command=self._set_chan)
+        # MIDI Out Port (Per Track)
+        tk.Label(out_frame, text="Port", font=LF, fg="#ddd", bg="#222").pack(side="left", padx=2)
+        outs = self.be._get_port_names(self.be.midi_out)
+        self.track_port = tk.StringVar(value=state.cur.midi_out_port)
+        self.track_port_menu = tk.OptionMenu(out_frame, self.track_port, state.cur.midi_out_port, *outs, command=self._set_track_port)
+        self.track_port_menu.config(width=15)
+        self.track_port_menu.pack(side="left", padx=4)
+        tk.Button(out_frame, text="Refresh", font=BF, command=self._refresh_midi_ports).pack(side="left", padx=4)
+        tk.Label(out_frame, text="Ch", font=LF, fg="#ddd", bg="#222").pack(side="left", padx=(12, 2))
+        self.chan = tk.Spinbox(out_frame, from_=1, to=16, width=3, command=self._set_chan)
         self.chan.delete(0, "end"); self.chan.insert(0, state.cur.midi_chan + 1)
         self.chan.pack(side="left")
 
@@ -627,6 +837,7 @@ class SequencerGUI:
             data_to_save['tracks'].append({
                 'name': track.name, 'steps': track.steps,
                 'midi_chan': track.midi_chan,
+                'midi_out_port': track.midi_out_port,
                 'mute': track.mute, 'scale': track.scale,
                 'root_note': track.root_note, 'subdivision': track.subdivision
             })
@@ -661,20 +872,32 @@ class SequencerGUI:
                         state.tracks[i].steps = new_steps
                     elif hasattr(state.tracks[i], key):
                         setattr(state.tracks[i], key, val)
+                
+                # Ensure midi_out_port is set (backward compatibility)
+                if not hasattr(state.tracks[i], 'midi_out_port'):
+                    state.tracks[i].midi_out_port = "MonomeSeq Out"
         self.bpm.set(state.bpm)
         self.swing.set(state.swing * 100)
         self._refresh_ui()
 
+    def _on_midi_in_port_change(self, selected_port):
+        """Called when user selects a different MIDI input port."""
+        self.be.set_in_port(selected_port)
+    
     def _refresh_midi_ports(self):
-        outs = self.be.midi_out.get_ports()
+        outs = self.be._get_port_names(self.be.midi_out)
         if outs:
-            self.port.set(outs[0])  # Update the displayed value
-            menu = self.port_menu.children["menu"]
+            # Update track-specific MIDI output port menu
+            menu = self.track_port_menu.children["menu"]
             menu.delete(0, "end")  # Clear existing options
             for port_name in outs:
-                menu.add_command(label=port_name, command=tk._setit(self.port, port_name))
+                menu.add_command(label=port_name, command=tk._setit(self.track_port, port_name, self._set_track_port))
+            # Only set to first port if no port is currently selected
+            if not self.track_port.get() or self.track_port.get() == "No devices found":
+                self.track_port.set(outs[0])
+                state.cur.midi_out_port = outs[0]
         else:
-            self.port.set("No devices found")
+            self.track_port.set("No devices found")
         self.refresh_midi_in_ports()
 
     def _set_track_name(self, event=None):
@@ -724,6 +947,12 @@ class SequencerGUI:
     def _set_chan(self):
         ch=max(1,min(16,int(self.chan.get())))-1
         state.cur.midi_chan=ch
+    
+    def _set_track_port(self, port_name):
+        """Set MIDI output port for current track."""
+        state.cur.midi_out_port = port_name
+        # Ensure the port is available in backend
+        self.be.get_midi_output(port_name)
     def _toggle_mute(self):
         state.cur.mute=bool(self.mute_var.get()); self.be.redraw_monome()
 
@@ -739,35 +968,16 @@ class SequencerGUI:
         self.be.redraw_monome()
 
     def _refresh_ui(self):
-        self.refresh_midi_in_ports()
         """Updates all GUI elements for the current track, but does NOT touch hardware."""
+        # Update track name and channel
         self.track_name_var.set(state.cur.name)
-        # Highlight the current track name entry
-        self.track_name_entry.config(highlightbackground="#F19225")  # Example highlight color
+        self.track_name_entry.config(highlightbackground="#F19225")  # Highlight current track
         self.chan.delete(0,"end"); self.chan.insert(0,state.cur.midi_chan+1)
-        self.mute_var.set(1 if state.cur.mute else 0)
-
-        # Update scale controls
-        root_note = state.cur.root_note
-        octave = (root_note // 12) - 1
-        note_name = NOTE_NAMES[root_note % 12]
-        self.root_note_var.set(note_name)
-        self
         
-        sospin.delete(0, "end"); self.root_oct_spin.insert(0, str(octave))
-        self.scale_var.set(state.cur.scale)
-
-        # Update subdivision control
-        subdiv_name = next((k for k, v in SUBDIVISIONS.items() if v == state.cur.subdivision), "1/16")
-        self.subdiv_var.set(subdiv_name)
-
-        self.draw_grid()
-
-    def refresh_midi_in_ports(self):
-        ports = self.be.midi_in.get_ports()
-        if ports: self.midi_in_port.set(ports[0])
-        else: self.midi_in_port.set("No devices found")
-
+        # Update MIDI output port
+        self.track_port.set(state.cur.midi_out_port)
+        
+        # Update mute state
         self.mute_var.set(1 if state.cur.mute else 0)
 
         # Update scale controls
@@ -783,6 +993,21 @@ class SequencerGUI:
         self.subdiv_var.set(subdiv_name)
 
         self.draw_grid()
+
+    def refresh_midi_in_ports(self):
+        """Refresh MIDI input port options without changing current selection."""
+        ports = self.be._get_port_names(self.be.midi_in)
+        if ports:
+            # Update the menu options
+            menu = self.midi_in_menu.children["menu"]
+            menu.delete(0, "end")  # Clear existing options
+            for port_name in ports:
+                menu.add_command(label=port_name, command=tk._setit(self.midi_in_port_var, port_name))
+            # Only set to first port if no port is currently selected
+            if not self.midi_in_port_var.get() or self.midi_in_port_var.get() == "No devices found":
+                self.midi_in_port_var.set(ports[0])
+        else:
+            self.midi_in_port_var.set("No devices found")
 
 # ───────── main entry ─────────────────────────────────────
 async def main():
