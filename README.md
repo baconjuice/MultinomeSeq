@@ -11,7 +11,7 @@ A multi-track step sequencer for Multiple Monome grids with MIDI output, GUI vis
 - **Multiple Monome support** (e.g., two 8x8 devices combined into 8x16).
 - **Swing control** and **BPM slider**.
 - **Track mute**, **octave transpose**, and **MIDI device selection**.
-- **Starting key and **Scale selection
+- **Starting key, Scale and Octave selection**
 
 ## Requirements
 - Python 3.9+
@@ -41,7 +41,6 @@ python MultinomeSeqV2.4.py
   - **Subdivision**: Change how the beat is subdivided, per page
   - **BPM Slider**: Set the tempo.
   - **Swing Slider**: Adjust swing feel.
-  - **Octave Buttons**: Transpose the current track.
   - **Track Navigation**: Switch between the 6 tracks.
   - **Mute**: Temporarily mute a track.
   - **Midi In/Sync**: Select MIDI input port and Clock Options (Internal, Send. Receive)
