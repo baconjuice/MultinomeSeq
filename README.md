@@ -27,7 +27,7 @@ pip install -r requirements.txt
 
 ## Usage
 ```bash
-python MultinomeSeqV2.4.py
+python3 MultinomeSeqV2.6.py
 ```
 
 - Use your Monome grid(s) to toggle steps.
