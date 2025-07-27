@@ -21,7 +21,7 @@ ROWS        = 8
 CELL_SIZE   = 20
 BASE_NOTE   = 36
 GATE_RATIO  = 0.9
-TRACKS      = 4
+TRACKS      = 6
 VEL_DEF     = 100          # velocity set by normal click
 VEL_INC     = 15           # velocity increase on shift-click
 # The main clock ticks once per 16th note. These values are multiples of that base tick.
@@ -728,10 +728,10 @@ class SequencerGUI:
         self.chan.pack(side="left")
 
         # row4 track nav + mute
-        tk.Button(ctrl, text="◀", font=BF, width=2, command=self.prev_track).grid(row=4, column=0, pady=4)
+        tk.Button(ctrl, text="◀", font=BF, width=2, command=self.prev_track).grid(row=3, column=0, pady=4)
         self.track_name_var = tk.StringVar()
         self.track_name_entry = tk.Entry(ctrl, textvariable=self.track_name_var, font=LF, bg="#555", fg="#ddd", width=30, justify='center', bd=0, highlightthickness=1, highlightbackground="#444")
-        self.track_name_entry.grid(row=4, column=1, columnspan=2)
+        self.track_name_entry.grid(row=3, column=1, columnspan=2)
         self.track_name_entry.bind("<Return>", self._set_track_name)
         self.track_name_entry.bind("<FocusOut>", self._set_track_name)
         tk.Button(ctrl, text="▶", font=BF, width=2, command=self.next_track).grid(row=3, column=3)
